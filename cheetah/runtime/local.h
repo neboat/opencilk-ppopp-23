@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "internal-malloc-impl.h" /* for cilk_im_desc */
+#include "rts-config.h"
 
 struct hyper_table_cache;
 
@@ -19,7 +20,9 @@ struct local_state {
     jmpbuf rts_ctx;
     struct cilk_fiber_pool fiber_pool;
     struct cilk_im_desc im_desc;
+#if CILK_STATS
     struct sched_stats stats;
+#endif
 };
 
 #endif /* _CILK_LOCAL_H */

@@ -20,6 +20,9 @@
 
 #define __CILKRTS_ABI_VERSION 4
 
+// NOTE: Set CILK_DEBUG to 0 and ENABLE_THIEF_SLEEP to 0 for empirical
+// evaluation of OpenCilk paper.
+
 #ifndef CILK_DEBUG
 #define CILK_DEBUG 0
 #endif

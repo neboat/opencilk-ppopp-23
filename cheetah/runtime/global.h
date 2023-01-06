@@ -117,7 +117,9 @@ struct global_state {
 
     struct hyper_table *hyper_table;
 
+#if CILK_STATS
     struct global_sched_stats stats;
+#endif
 };
 
 CHEETAH_INTERNAL extern global_state *default_cilkrts;

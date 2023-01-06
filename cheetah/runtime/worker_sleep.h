@@ -488,7 +488,6 @@ handle_failed_steal_attempts(global_state *const rts, worker_id self,
                             (fails > SLEEP_THRESHOLD) ? SLEEP_NSEC : NAP_NSEC};
                     nanosleep(&sleeptime, NULL);
                 } else {
-                    busy_loop_pause();
                 }
             } else {
 #else
