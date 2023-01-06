@@ -1,9 +1,13 @@
 #ifndef _WORKER_SLEEP_H
 #define _WORKER_SLEEP_H
 
+#include <stdatomic.h>
+#include <stdint.h>
+#include <limits.h>
 #include <time.h>
 
 #include "cilk-internal.h"
+#include "global.h"
 #include "sched_stats.h"
 #include "worker_coord.h"
 
@@ -84,10 +88,6 @@ static inline __attribute__((always_inline)) void steal_short_pause(void) {
         busy_loop_pause();
         busy_loop_pause();
         busy_loop_pause();
-        busy_loop_pause();
-        busy_loop_pause();
-        busy_loop_pause();
-        busy_loop_pause();
     } while ((__builtin_readcyclecounter() - start) < 1600);
 #endif
 }
@@ -115,6 +115,32 @@ static void swap_worker_with_target(global_state *g, worker_id self,
     // Update the worker-to-index map.
     worker_to_index[target_worker] = self_index;
     worker_to_index[self] = target_index;
+}
+
+__attribute__((always_inline)) static inline uint64_t
+add_to_sentinels(global_state *const rts, int32_t val) {
+    return atomic_fetch_add_explicit(&rts->disengaged_sentinel, val,
+                                     memory_order_release);
+}
+
+__attribute__((always_inline)) static inline uint64_t
+add_to_disengaged(global_state *const rts, int32_t val) {
+    while (true) {
+        uint64_t disengaged_sentinel = atomic_load_explicit(
+            &rts->disengaged_sentinel, memory_order_relaxed);
+        uint32_t disengaged = GET_DISENGAGED(disengaged_sentinel);
+        uint32_t sentinel = GET_SENTINEL(disengaged_sentinel);
+        uint64_t new_disengaged_sentinel =
+            DISENGAGED_SENTINEL(disengaged + val, sentinel);
+
+        if (atomic_compare_exchange_strong_explicit(
+                &rts->disengaged_sentinel, &disengaged_sentinel,
+                new_disengaged_sentinel, memory_order_release,
+                memory_order_acquire))
+            return disengaged_sentinel;
+
+        busy_loop_pause();
+    }
 }
 
 // Called by a thief thread.  Causes the thief thread to try to sleep, that is,
@@ -167,6 +193,7 @@ static bool try_to_disengage_thief(global_state *g, worker_id self,
             uint32_t sentinel = GET_SENTINEL(disengaged_sentinel);
             new_disengaged_sentinel =
                 DISENGAGED_SENTINEL(disengaged - 1, sentinel + 1);
+
             if (atomic_compare_exchange_strong_explicit(
                     &g->disengaged_sentinel, &disengaged_sentinel,
                     new_disengaged_sentinel, memory_order_release,
@@ -199,6 +226,7 @@ get_worker_counts(__cilkrts_worker *const w, uint64_t disengaged_sentinel,
     uint32_t sentinel = GET_SENTINEL(disengaged_sentinel);
     CILK_ASSERT(w, disengaged < nworkers);
     CILK_ASSERT(w, sentinel <= nworkers);
+    CILK_ASSERT(w, sentinel + disengaged <= nworkers);
     int32_t active =
         (int32_t)nworkers - (int32_t)disengaged - (int32_t)sentinel;
 
@@ -247,14 +275,13 @@ maybe_reengage_workers(global_state *const rts, worker_id self,
                        unsigned int *const sentinel_count_history,
                        unsigned int *const sentinel_count_history_tail,
                        unsigned int *const recent_sentinel_count) {
+#if !ENABLE_THIEF_SLEEP
+    return 0;
+#endif
     if (fails >= SENTINEL_THRESHOLD) {
         // This thief is no longer a sentinel.  Decrement the number of
         // sentinels.
-        uint64_t disengaged_sentinel = atomic_fetch_sub_explicit(
-            &rts->disengaged_sentinel, 1, memory_order_release);
-#if !ENABLE_THIEF_SLEEP
-        return 0;
-#endif
+        uint64_t disengaged_sentinel = add_to_sentinels(rts, -1);
         // Get the current worker counts, with this sentinel now active.
         worker_counts counts =
             get_worker_counts(w, disengaged_sentinel - 1, nworkers);
@@ -412,11 +439,47 @@ handle_failed_steal_attempts(global_state *const rts, worker_id self,
             const struct timespec sleeptime = {.tv_sec = 0, .tv_nsec = SLEEP_NSEC};
             nanosleep(&sleeptime, NULL);
         } else {
-            if (SENTINEL_THRESHOLD == fails)
-                atomic_fetch_add_explicit(&rts->disengaged_sentinel, 1,
-                                          memory_order_release);
+#if ENABLE_THIEF_SLEEP
+            if (SENTINEL_THRESHOLD == fails) {
+                add_to_sentinels(rts, 1);
+            }
+
+            // Check the current worker counts.
+            uint64_t disengaged_sentinel = atomic_load_explicit(
+                &rts->disengaged_sentinel, memory_order_acquire);
+            worker_counts counts =
+                get_worker_counts(w, disengaged_sentinel, nworkers);
+
+            // Update the sentinel count.
+            unsigned int current_sentinel_count = counts.sentinels;
+            unsigned int tail = *sentinel_count_history_tail;
+            *recent_sentinel_count = *recent_sentinel_count -
+                                     sentinel_count_history[tail] +
+                                     current_sentinel_count;
+            sentinel_count_history[tail] = current_sentinel_count;
+            *sentinel_count_history_tail = (tail + 1) % SENTINEL_COUNT_HISTORY;
+
+            // Update the efficient history.
+            history_t curr_eff = is_efficient(counts);
+            history_t my_efficient_history = *efficient_history;
+            my_efficient_history = (my_efficient_history >> 1) |
+                                   (curr_eff << (HISTORY_LENGTH - 1));
+            int32_t eff_steps = __builtin_popcount(my_efficient_history);
+            *efficient_history = my_efficient_history;
+
+            // Update the inefficient history.
+            history_t curr_ineff = is_inefficient(counts);
+            history_t my_inefficient_history = *inefficient_history;
+            my_inefficient_history = (my_inefficient_history >> 1) |
+                                     (curr_ineff << (HISTORY_LENGTH - 1));
+            int32_t ineff_steps =
+                __builtin_popcount(my_inefficient_history);
+            *inefficient_history = my_inefficient_history;
+
+#endif
 #if BOSS_THIEF
             if (is_boss_thread) {
+
                 if (fails % NAP_THRESHOLD == 0) {
                     // The boss thread should never disengage.  Sleep instead.
                     const struct timespec sleeptime = {
@@ -424,49 +487,19 @@ handle_failed_steal_attempts(global_state *const rts, worker_id self,
                         .tv_nsec =
                             (fails > SLEEP_THRESHOLD) ? SLEEP_NSEC : NAP_NSEC};
                     nanosleep(&sleeptime, NULL);
+                } else {
+                    busy_loop_pause();
                 }
             } else {
 #else
             {
 #endif
 #if ENABLE_THIEF_SLEEP
-                // Check if the current worker counts.
-                uint64_t disengaged_sentinel = atomic_load_explicit(
-                    &rts->disengaged_sentinel, memory_order_acquire);
-                worker_counts counts =
-                    get_worker_counts(w, disengaged_sentinel, nworkers);
-
-                // Update the efficient history.
-                history_t curr_eff = is_efficient(counts);
-                history_t my_efficient_history = *efficient_history;
-                my_efficient_history = (my_efficient_history >> 1) |
-                                       (curr_eff << (HISTORY_LENGTH - 1));
-                int32_t eff_steps = __builtin_popcount(my_efficient_history);
-                *efficient_history = my_efficient_history;
-
-                // Update the sentinel count.
-                unsigned int current_sentinel_count = counts.sentinels;
-                unsigned int tail = *sentinel_count_history_tail;
-                *recent_sentinel_count = *recent_sentinel_count -
-                                         sentinel_count_history[tail] +
-                                         current_sentinel_count;
-                sentinel_count_history[tail] = current_sentinel_count;
-                *sentinel_count_history_tail =
-                    (tail + 1) % SENTINEL_COUNT_HISTORY;
-
-                // Update the inefficient history.
-                history_t curr_ineff = is_inefficient(counts);
-                history_t my_inefficient_history = *inefficient_history;
-                my_inefficient_history = (my_inefficient_history >> 1) |
-                                         (curr_ineff << (HISTORY_LENGTH - 1));
-                int32_t ineff_steps =
-                    __builtin_popcount(my_inefficient_history);
-                *inefficient_history = my_inefficient_history;
 
                 if (ENABLE_THIEF_SLEEP && curr_ineff &&
                     (ineff_steps - eff_steps) > HISTORY_THRESHOLD) {
                     uint64_t start, end;
-		    start = gettime_fast();
+                    start = gettime_fast();
                     if (maybe_disengage_thief(rts, self, nworkers, w)) {
                         // The semaphore for reserving workers may have been
                         // non-zero due to past successful steals, rather than a
@@ -549,7 +582,7 @@ handle_failed_steal_attempts(global_state *const rts, worker_id self,
             busy_loop_pause();
             busy_loop_pause();
             busy_loop_pause();
-        } while ((__builtin_readcyclecounter() - start) < 3600);
+        } while ((__builtin_readcyclecounter() - start) < 2800);
 #endif
     }
     CILK_STOP_TIMING(w, INTERVAL_SLEEP);
@@ -588,9 +621,9 @@ decrease_fails_by_work(global_state *const rts, __cilkrts_worker *const w,
     uint64_t scaled_elapsed = get_scaled_elapsed(elapsed);
 
     // Decrease the number of fails based on the work done.
-    if (scaled_elapsed > (uint64_t)fails)
+    if (scaled_elapsed > (uint64_t)fails) {
         fails = 0;
-    else {
+    } else {
         fails -= scaled_elapsed;
     }
 
@@ -605,8 +638,7 @@ decrease_fails_by_work(global_state *const rts, __cilkrts_worker *const w,
 
     // If this worker is still sentinel, update sentinel-worker count.
     if (fails >= SENTINEL_THRESHOLD)
-        atomic_fetch_add_explicit(&rts->disengaged_sentinel, 1,
-                                  memory_order_release);
+        add_to_sentinels(rts, 1);
     return fails;
 }
 #endif // ENABLE_THIEF_SLEEP
@@ -636,8 +668,7 @@ reset_fails(global_state *rts, unsigned int fails) {
     if (fails >= SENTINEL_THRESHOLD) {
         // If this worker was sentinel, decrement the number of sentinel
         // workers, effectively making this worker active.
-        atomic_fetch_sub_explicit(&rts->disengaged_sentinel, 1,
-                                  memory_order_release);
+        add_to_sentinels(rts, -1);
     }
     return 0;
 }
@@ -645,8 +676,7 @@ reset_fails(global_state *rts, unsigned int fails) {
 __attribute__((always_inline)) static inline void
 disengage_worker(global_state *g, unsigned int nworkers, worker_id self) {
     cilk_mutex_lock(&g->index_lock);
-    uint64_t disengaged_sentinel = atomic_fetch_add_explicit(
-        &g->disengaged_sentinel, (1UL << 32), memory_order_release);
+    uint64_t disengaged_sentinel = add_to_disengaged(g, 1);
     // Update the index-to-worker map.  We derive last_index from the new value
     // of disengaged_sentinel, because the index is now invalid.
     worker_id last_index = nworkers - ((disengaged_sentinel >> 32) + 1);
@@ -660,8 +690,7 @@ disengage_worker(global_state *g, unsigned int nworkers, worker_id self) {
 __attribute__((always_inline)) static inline void
 reengage_worker(global_state *g, unsigned int nworkers, worker_id self) {
     cilk_mutex_lock(&g->index_lock);
-    uint64_t disengaged_sentinel = atomic_fetch_sub_explicit(
-        &g->disengaged_sentinel, (1UL << 32), memory_order_release);
+    uint64_t disengaged_sentinel = add_to_disengaged(g, -1);
     // Update the index-to-worker map.  We derive last_index from the old value
     // of disengaged_sentinel, because the index is now valid.
     worker_id last_index = nworkers - (disengaged_sentinel >> 32);

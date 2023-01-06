@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #ifdef __linux__
 #include <sched.h>
 #endif
@@ -143,7 +145,6 @@ static void setup_for_sync(__cilkrts_worker *w, Closure *t) {
     // ANGE: this must be true since in case a) we would have freed it in
     // Cilk_sync, or in case b) we would have freed it when we first returned to
     // the runtime before doing the provably good steal.
-    CILK_ASSERT(w, w->l->fiber_to_free == NULL);
     CILK_ASSERT(w, t->fiber != t->fiber_child);
 
     if (t->simulated_stolen == false) {
@@ -157,7 +158,8 @@ static void setup_for_sync(__cilkrts_worker *w, Closure *t) {
         t->fiber_child = NULL;
 
         if (USE_EXTENSION) {
-            cilk_fiber_deallocate_to_pool(w, t->ext_fiber);
+            if (t->ext_fiber)
+                cilk_fiber_deallocate_to_pool(w, t->ext_fiber);
             t->ext_fiber = t->ext_fiber_child;
             t->ext_fiber_child = NULL;
         }
@@ -503,7 +505,7 @@ static Closure *Closure_return(__cilkrts_worker *const w, Closure *child) {
         // Case where we are not the leftmost stack.
         CILK_ASSERT(w, parent->fiber_child != child->fiber);
         cilk_fiber_deallocate_to_pool(w, child->fiber);
-        if (USE_EXTENSION) {
+        if (USE_EXTENSION && child->ext_fiber) {
             cilk_fiber_deallocate_to_pool(w, child->ext_fiber);
         }
     } else {
@@ -1051,6 +1053,15 @@ static Closure *extract_top_spawning_closure(ReadyDeque *deques,
     return res;
 }
 
+static inline void Closure_steal_pause(uint64_t start) {
+    while ((__builtin_readcyclecounter() - start) < 2400) {
+        busy_loop_pause();
+        busy_loop_pause();
+        busy_loop_pause();
+        busy_loop_pause();
+    }
+}
+
 /*
  * stealing protocol.  Tries to steal from the victim; returns a
  * stolen closure, or NULL if none.
@@ -1063,8 +1074,7 @@ static Closure *Closure_steal(__cilkrts_worker **workers, ReadyDeque *deques,
     __cilkrts_worker *victim_w;
     victim_w = workers[victim];
 
-    if (victim_w == NULL)
-        return NULL;
+    uint64_t start = __builtin_readcyclecounter();
 
     // Fast test for an unsuccessful steal attempt using only read operations.
     // This fast test seems to improve parallel performance.
@@ -1074,12 +1084,14 @@ static Closure *Closure_steal(__cilkrts_worker **workers, ReadyDeque *deques,
         __cilkrts_stack_frame **tail =
             atomic_load_explicit(&victim_w->tail, memory_order_relaxed);
         if (head >= tail) {
+            Closure_steal_pause(start);
             return NULL;
         }
     }
 
     //----- EVENT_STEAL_ATTEMPT
     if (deque_trylock(deques, w, victim) == 0) {
+        Closure_steal_pause(start);
         return NULL;
     }
 
@@ -1088,6 +1100,7 @@ static Closure *Closure_steal(__cilkrts_worker **workers, ReadyDeque *deques,
     if (cl) {
         if (Closure_trylock(w, cl) == 0) {
             deque_unlock(deques, w, victim);
+            Closure_steal_pause(start);
             return NULL;
         }
 
@@ -1136,6 +1149,7 @@ static Closure *Closure_steal(__cilkrts_worker **workers, ReadyDeque *deques,
             // see rule D in the file PROTOCOLS
             Closure_unlock(w, cl);
             deque_unlock(deques, w, victim);
+            Closure_steal_pause(start);
             break;
 
         default:
@@ -1148,6 +1162,7 @@ static Closure *Closure_steal(__cilkrts_worker **workers, ReadyDeque *deques,
         }
     } else {
         deque_unlock(deques, w, victim);
+        Closure_steal_pause(start);
         //----- EVENT_STEAL_EMPTY_DEQUE
     }
 
@@ -1313,24 +1328,6 @@ int Cilk_sync(__cilkrts_worker *const w, __cilkrts_stack_frame *frame) {
     // when sync fails, the user_rmap should remain NULL at this point.
     CILK_ASSERT(w, t->user_rmap == (cilkred_map *)NULL);
 
-    // ANGE: we might have passed a sync successfully before and never
-    // gotten back to runtime but returning to another ancestor that needs
-    // to sync ... in which case we might have a fiber to free, but it's
-    // never the same fiber that we are on right now.
-    local_state *l = w->l;
-    if (l->fiber_to_free) {
-        CILK_ASSERT(w, l->fiber_to_free != t->fiber);
-        // we should free this fiber now and we can as long as we are not on
-        // it
-        cilk_fiber_deallocate_to_pool(w, l->fiber_to_free);
-        l->fiber_to_free = NULL;
-    }
-    if (USE_EXTENSION && l->ext_fiber_to_free) {
-        CILK_ASSERT(w, l->ext_fiber_to_free != t->ext_fiber);
-        cilk_fiber_deallocate_to_pool(w, l->ext_fiber_to_free);
-        l->ext_fiber_to_free = NULL;
-    }
-
     if (Closure_has_children(t)) {
         cilkrts_alert(SYNC, w,
                       "(Cilk_sync) Closure %p has outstanding children",
@@ -1344,7 +1341,7 @@ int Cilk_sync(__cilkrts_worker *const w, __cilkrts_stack_frame *frame) {
         } else {
             t->saved_throwing_fiber = t->fiber;
         }
-        if (USE_EXTENSION) {
+        if (USE_EXTENSION && t->ext_fiber) {
             cilk_fiber_deallocate_to_pool(w, t->ext_fiber);
         }
         t->fiber = NULL;
@@ -1406,10 +1403,6 @@ static void do_what_it_says(ReadyDeque *deques, __cilkrts_worker *w,
 
         switch (t->status) {
         case CLOSURE_READY:
-            // ANGE: anything we need to free must have been freed at this point
-            CILK_ASSERT(w, l->fiber_to_free == NULL);
-            CILK_ASSERT(w, l->ext_fiber_to_free == NULL);
-
             cilkrts_alert(SCHED, w, "(do_what_it_says) CLOSURE_READY");
             /* just execute it */
             setup_for_execution(w, t);
@@ -1446,15 +1439,6 @@ static void do_what_it_says(ReadyDeque *deques, __cilkrts_worker *w,
                 CILK_ASSERT_POINTER_EQUAL(w, w, __cilkrts_get_tls_worker());
                 sanitizer_finish_switch_fiber();
                 worker_change_state(w, WORKER_SCHED);
-                // CILK_ASSERT(w, t->fiber == w->l->fiber_to_free);
-                if (l->fiber_to_free) {
-                    cilk_fiber_deallocate_to_pool(w, l->fiber_to_free);
-                    l->fiber_to_free = NULL;
-                }
-                if (USE_EXTENSION && l->ext_fiber_to_free) {
-                    cilk_fiber_deallocate_to_pool(w, l->ext_fiber_to_free);
-                    l->ext_fiber_to_free = NULL;
-                }
 
                 // Attempt to get a closure from the bottom of our deque.
                 deque_lock_self(deques, w);
@@ -1516,13 +1500,14 @@ void worker_scheduler(__cilkrts_worker *w) {
     // Get this worker's local_state pointer, to avoid rereading it
     // unnecessarily during the work-stealing loop.  This optimization helps
     // reduce sharing on the worker structure.
-    unsigned int rand_state = w->l->rand_next;
+    local_state *l = w->l;
+    unsigned int rand_state = l->rand_next;
 
     // Get the number of workers.  We don't currently support changing the
     // number of workers dynamically during execution of a Cilkified region.
     unsigned int nworkers = rts->nworkers;
     // Initialize count of consecutive failed steal attempts.
-    unsigned int fails = init_fails(w->l->wake_val, rts);
+    unsigned int fails = init_fails(l->wake_val, rts);
     unsigned int sample_threshold = SENTINEL_THRESHOLD;
     // Local history information of the state of the system, for sentinel
     // workers to use to determine when to disengage and how many workers to
@@ -1572,7 +1557,7 @@ void worker_scheduler(__cilkrts_worker *w) {
                 worker_id victim =
                         index_to_worker[get_rand(rand_state) % stealable];
                 rand_state = update_rand_state(rand_state);
-                while (victim == self) {
+                while (victim == self || __builtin_expect(workers[victim] == NULL, false)) {
                     victim = index_to_worker[get_rand(rand_state) % stealable];
                     rand_state = update_rand_state(rand_state);
                 }
@@ -1580,7 +1565,7 @@ void worker_scheduler(__cilkrts_worker *w) {
                 t = Closure_steal(workers, deques, w, victim);
                 if (!t) {
                     // Pause inside this busy loop.
-                    steal_short_pause();
+                    /* steal_short_pause(); */
                 }
             } while (!t && --attempt > 0);
 
@@ -1652,8 +1637,10 @@ void worker_scheduler(__cilkrts_worker *w) {
     }
 
     // Reset the fail count.
+#if ENABLE_THIEF_SLEEP
     reset_fails(rts, fails);
-    w->l->rand_next = rand_state;
+#endif
+    l->rand_next = rand_state;
 
     CILK_STOP_TIMING(w, INTERVAL_SCHED);
     worker_change_state(w, WORKER_IDLE);
@@ -1681,6 +1668,7 @@ void *scheduler_thread_proc(void *arg) {
     // Avoid redundant lookups of these commonly accessed worker fields.
     const worker_id self = w->self;
     global_state *rts = w->g;
+    local_state *l = w->l;
     const unsigned int nworkers = rts->nworkers;
 
     // Initialize worker's random-number generator.
@@ -1688,6 +1676,7 @@ void *scheduler_thread_proc(void *arg) {
 
     CILK_START_TIMING(w, INTERVAL_SLEEP_UNCILK);
     do {
+        l->wake_val = nworkers;
         // Wait for g->start == 1 to start executing the work-stealing loop.  We
         // use a condition variable to wait on g->start, because this approach
         // seems to result in better performance.
@@ -1698,7 +1687,7 @@ void *scheduler_thread_proc(void *arg) {
 #endif
             if (thief_should_wait(rts)) {
                 disengage_worker(rts, nworkers, self);
-                w->l->wake_val = thief_wait(rts);
+                l->wake_val = thief_wait(rts);
                 reengage_worker(rts, nworkers, self);
             }
 #if !BOSS_THIEF
